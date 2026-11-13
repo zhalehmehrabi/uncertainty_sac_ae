@@ -1,3 +1,9 @@
 __pycache__/
 .ipynb_checkpoints/
 runs
+# BEGIN
+# Keep W&B credentials and generated run data local.
+wandb.yml
+wandb.yaml
+wandb/
+# END

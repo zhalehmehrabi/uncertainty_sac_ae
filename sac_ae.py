@@ -4,6 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 import math
+# BEGIN
+# validate nonnegative integer AE priority-start thresholds
+import operator
+# END
 
 import utils
 from encoder import make_encoder
@@ -133,14 +137,43 @@ class QFunction(nn.Module):
         return self.trunk(obs_action)
 
 
+# BEGIN
+# validate ensemble sizes for unbiased critic-disagreement scoring
+def _validate_n_critics(value):
+    count = utils.positive_integer(value, 'n_critics')
+    if count < 2:
+        raise ValueError('n_critics must be an integer at least 2')
+    return count
+# END
+
+
+# BEGIN
+# reject invalid AE priority warm-up thresholds before initialization
+def _validate_ae_priority_warmup_steps(value):
+    message = 'ae_priority_warmup_steps must be a nonnegative integer'
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        steps = operator.index(value)
+    except TypeError:
+        raise ValueError(message)
+    if steps < 0:
+        raise ValueError(message)
+    return steps
+# END
+
+
 class Critic(nn.Module):
-    """Critic network, employes two q-functions."""
+    # BEGIN
+    # configurable online heads with the original Q-pair interface
+    """Shared encoder and Q heads; forward() exposes the original SAC pair."""
     def __init__(
         self, obs_shape, action_shape, hidden_dim, encoder_type,
-        encoder_feature_dim, num_layers, num_filters
+        encoder_feature_dim, num_layers, num_filters, n_critics=2
     ):
         super().__init__()
-
+        self.n_critics = _validate_n_critics(n_critics)
+    # END
 
         self.encoder = make_encoder(
             encoder_type, obs_shape, encoder_feature_dim, num_layers,
@@ -154,6 +187,13 @@ class Critic(nn.Module):
             self.encoder.feature_dim, action_shape[0], hidden_dim
         )
 
+        # BEGIN
+        # register extra online heads before initialization and optimization
+        self.extra_Qs = nn.ModuleList([
+            QFunction(self.encoder.feature_dim, action_shape[0], hidden_dim)
+            for _ in range(self.n_critics - 2)
+        ])
+        # END
         self.outputs = dict()
         self.apply(weight_init)
 
@@ -168,6 +208,17 @@ class Critic(nn.Module):
         self.outputs['q2'] = q2
 
         return q1, q2
+
+    # BEGIN
+    # evaluate the full ensemble using one shared encoder pass
+    def forward_all(self, obs, action, detach_encoder=False):
+        """Return Q predictions shaped (n_critics, batch_size, 1)."""
+        encoded = self.encoder(obs, detach=detach_encoder)
+        predictions = [self.Q1(encoded, action), self.Q2(encoded, action)]
+        predictions.extend(head(encoded, action) for head in self.extra_Qs)
+        self.outputs['q1'], self.outputs['q2'] = predictions[:2]
+        return torch.stack(predictions, dim=0)
+    # END
 
     def log(self, L, step, log_freq=LOG_FREQ):
         if step % log_freq != 0:
@@ -185,6 +236,8 @@ class Critic(nn.Module):
 
 class SacAeAgent(object):
     """SAC+AE algorithm."""
+    # BEGIN
+    # configurable online ensemble count, defaulting to five
     def __init__(
         self,
         obs_shape,
@@ -214,8 +267,31 @@ class SacAeAgent(object):
         decoder_latent_lambda=0.0,
         decoder_weight_lambda=0.0,
         num_layers=4,
-        num_filters=32
+        num_filters=32,
+        n_critics=5,
+        # BEGIN
+        # expose the absolute AE priority-start step in the agent API
+        ae_priority_warmup_steps=0,
+        # END
+        # BEGIN
+        # Select the score used for AE priorities; keep variance as the default.
+        uncertainty_estimator='ensemble'
+        # END
     ):
+        self.n_critics = _validate_n_critics(n_critics)
+        # BEGIN
+        # store the validated AE threshold before allocating model weights
+        self.ae_priority_warmup_steps = _validate_ae_priority_warmup_steps(
+            ae_priority_warmup_steps
+        )
+        # END
+        # BEGIN
+        # Validate the estimator before allocating model weights.
+        if uncertainty_estimator not in ('ensemble', 'ensemble_td_error'):
+            raise ValueError('uncertainty_estimator must be ensemble or ensemble_td_error')
+        self.uncertainty_estimator = uncertainty_estimator
+        # END
+    # END
         self.device = device
         self.discount = discount
         self.critic_tau = critic_tau
@@ -233,15 +309,33 @@ class SacAeAgent(object):
 
         self.critic = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters
+            # BEGIN
+            # apply the requested online ensemble size
+            encoder_feature_dim, num_layers, num_filters, n_critics=self.n_critics
+            # END
         ).to(device)
 
         self.critic_target = Critic(
             obs_shape, action_shape, hidden_dim, encoder_type,
-            encoder_feature_dim, num_layers, num_filters
+            # BEGIN
+            # SAC bootstrapping retains only the original target pair
+            encoder_feature_dim, num_layers, num_filters, n_critics=2
+            # END
         ).to(device)
 
-        self.critic_target.load_state_dict(self.critic.state_dict())
+        # BEGIN
+        # initialize target components from their online counterparts
+        self.critic_target.encoder.load_state_dict(self.critic.encoder.state_dict())
+        self.critic_target.Q1.load_state_dict(self.critic.Q1.state_dict())
+        self.critic_target.Q2.load_state_dict(self.critic.Q2.state_dict())
+        # END
+        # BEGIN
+        # Ensemble TD needs a matching target for every online head. Copying
+        # the extra heads avoids drawing any extra initialization randomness.
+        if self.uncertainty_estimator == 'ensemble_td_error':
+            self.critic_target.extra_Qs = copy.deepcopy(self.critic.extra_Qs)
+            self.critic_target.n_critics = self.n_critics
+        # END
 
         # tie encoders between actor and critic
         self.actor.encoder.copy_conv_weights_from(self.critic.encoder)
@@ -323,10 +417,11 @@ class SacAeAgent(object):
                                  target_Q2) - self.alpha.detach() * log_pi
             target_Q = reward + (not_done * self.discount * target_V)
 
-        # get current Q estimates
-        current_Q1, current_Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(current_Q1,
-                                 target_Q) + F.mse_loss(current_Q2, target_Q)
+        # BEGIN
+        # train every online head on the same uniform batch and SAC target
+        current_Qs = self.critic.forward_all(obs, action)
+        critic_loss = sum(F.mse_loss(current_Q, target_Q) for current_Q in current_Qs)
+        # END
         L.log('train_critic/loss', critic_loss, step)
 
 
@@ -336,6 +431,41 @@ class SacAeAgent(object):
         self.critic_optimizer.step()
 
         self.critic.log(L, step)
+
+    # BEGIN
+    # raw unbiased ensemble uncertainty without gradients or sampling
+    @torch.no_grad()
+    def compute_uncertainty(self, obs, action):
+        """Score stored (observation, action) pairs; replay adds epsilon/powers.
+
+        Variance is across online heads with divisor n_critics - 1. No policy
+        actions are sampled and existing parameter gradients are preserved.
+        """
+        if obs.size(0) == 0:
+            raise ValueError('cannot score an empty uncertainty batch')
+        predictions = self.critic.forward_all(obs, action)
+        uncertainty = predictions.var(dim=0, unbiased=True)
+        if not torch.isfinite(uncertainty).all():
+            raise ValueError('critic uncertainty must be finite')
+        return uncertainty
+    # END
+
+    # BEGIN
+    # Match the visualization ZIP: square residuals against the shared
+    # mean-of-target-heads Bellman target, then average over online heads.
+    @torch.no_grad()
+    def compute_ensemble_td_error(self, obs, action, reward, next_obs, not_done):
+        if obs.size(0) == 0:
+            raise ValueError('cannot score an empty uncertainty batch')
+        _, next_action, log_pi, _ = self.actor(next_obs)
+        target_value = self.critic_target.forward_all(next_obs, next_action).mean(dim=0)
+        target = reward + not_done * self.discount * (target_value - self.alpha.detach() * log_pi)
+        current = self.critic.forward_all(obs, action, detach_encoder=True)
+        score = (target - current).pow(2).mean(dim=0)
+        if not torch.isfinite(score).all():
+            raise ValueError('ensemble TD error must be finite')
+        return score
+    # END
 
     def update_actor_and_alpha(self, obs, L, step):
         # detach encoder, so we don't update it with the actor loss
@@ -407,13 +537,50 @@ class SacAeAgent(object):
             utils.soft_update_params(
                 self.critic.Q2, self.critic_target.Q2, self.critic_tau
             )
+            # BEGIN
+            # Sync the additional TD-scoring targets on the SAC target schedule.
+            for online, target in zip(self.critic.extra_Qs, self.critic_target.extra_Qs):
+                utils.soft_update_params(online, target, self.critic_tau)
+            # END
             utils.soft_update_params(
                 self.critic.encoder, self.critic_target.encoder,
                 self.encoder_tau
             )
 
-        if self.decoder is not None and step % self.decoder_update_freq == 0:
-            self.update_decoder(obs, obs, L, step)
+        # BEGIN
+        # match UCRL-C uniform warm-up and priority-only update frequency
+        if self.decoder is not None:
+            use_priority_for_ae = step >= self.ae_priority_warmup_steps
+            do_ae_update = (not use_priority_for_ae) or (
+                step % self.decoder_update_freq == 0
+            )
+            if do_ae_update:
+                if not use_priority_for_ae:
+                    # Reuse the uniform RL observations, including their batch size.
+                    self.update_decoder(obs, obs, L, step)
+                else:
+                    # BEGIN
+                    # Read the full prioritized transitions only for TD scoring.
+                    use_td = self.uncertainty_estimator == 'ensemble_td_error'
+                    if use_td:
+                        ae_obs, ae_action, ae_reward, ae_next_obs, ae_not_done, ae_indices = (
+                            replay_buffer.sample_ae(include_transition=True)
+                        )
+                    else:
+                        ae_obs, ae_action, ae_indices = replay_buffer.sample_ae()
+                    self.update_decoder(ae_obs, ae_obs, L, step)
+                    if use_td:
+                        uncertainty = self.compute_ensemble_td_error(
+                            ae_obs, ae_action, ae_reward, ae_next_obs, ae_not_done
+                        )
+                        metric = 'train_critic/ensemble_td_error_mean'
+                    else:
+                        uncertainty = self.compute_uncertainty(ae_obs, ae_action)
+                        metric = 'train_critic/ensemble_uncertainty_mean'
+                    replay_buffer.update_ae_priorities(ae_indices, uncertainty)
+                    L.log(metric, uncertainty.mean(), step)
+                    # END
+        # END
 
     def save(self, model_dir, step):
         torch.save(

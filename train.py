@@ -16,6 +16,10 @@ from logger import Logger
 from video import VideoRecorder
 
 from sac_ae import SacAeAgent
+# BEGIN
+# Adapt UCRL-C experiment naming to SAC+AE and its AE priority settings.
+from wandb_logger import experiment_name
+# END
 
 
 def parse_args():
@@ -28,16 +32,60 @@ def parse_args():
     parser.add_argument('--frame_stack', default=3, type=int)
     # replay buffer
     parser.add_argument('--replay_buffer_capacity', default=1000000, type=int)
+    # BEGIN
+    # expose the AE prioritization exponent as a script flag
+    parser.add_argument(
+        '--ae_priority_alpha', default=0.7, type=float,
+        help='Finite nonnegative AE priority exponent; 0 gives uniform AE sampling (default: %(default)s).'
+    )
+    # END
+    # BEGIN
+    # expose the reference-compatible AE epsilon as a script flag
+    parser.add_argument(
+        '--ae_priority_eps', default=1e-2, type=float,
+        help='Finite positive AE uncertainty offset and initial mass (default: %(default)s).'
+    )
+    # END
+    # BEGIN
+    # expose UCRL-C's absolute priority-start threshold for the AE branch
+    parser.add_argument(
+        '--ae_priority_warmup_steps', default=0, type=int,
+        help='Nonnegative absolute environment step to start prioritized AE sampling; '
+             'before it, AE reuses the uniform RL batch on every agent update '
+             '(default: %(default)s).'
+    )
+    # END
+    # BEGIN
+    # Use the same estimator selector as the reference ensemble-TD scripts.
+    parser.add_argument(
+        '--uncertainty_estimator', choices=('ensemble', 'ensemble_td_error'),
+        default='ensemble', help='Score prioritized AE transitions by critic variance or mean squared ensemble TD error.'
+    )
+    # END
     # train
     parser.add_argument('--agent', default='sac_ae', type=str)
     parser.add_argument('--init_steps', default=1000, type=int)
     parser.add_argument('--num_train_steps', default=1000000, type=int)
     parser.add_argument('--batch_size', default=128, type=int)
+    # BEGIN
+    # optional AE batch size independent of the RL batch size
+    parser.add_argument(
+        '--ae_batch_size', default=None, type=int,
+        help='Positive AE batch size; defaults to --batch_size when omitted.'
+    )
+    # END
     parser.add_argument('--hidden_dim', default=1024, type=int)
     # eval
     parser.add_argument('--eval_freq', default=10000, type=int)
     parser.add_argument('--num_eval_episodes', default=10, type=int)
     # critic
+    # BEGIN
+    # expose the online critic count needed for unbiased uncertainty
+    parser.add_argument(
+        '--n_critics', default=5, type=int,
+        help='Number of online critic heads; integer at least 2 (default: %(default)s).'
+    )
+    # END
     parser.add_argument('--critic_lr', default=1e-3, type=float)
     parser.add_argument('--critic_beta', default=0.9, type=float)
     parser.add_argument('--critic_tau', default=0.01, type=float)
@@ -66,7 +114,14 @@ def parse_args():
     parser.add_argument('--alpha_lr', default=1e-4, type=float)
     parser.add_argument('--alpha_beta', default=0.5, type=float)
     # misc
-    parser.add_argument('--seed', default=1, type=int)
+    # BEGIN
+    # one run seed also initializes the separate AE sampling generator
+    parser.add_argument(
+        '--seed', default=1, type=int,
+        help='Run seed for Python, NumPy, PyTorch, the environment and private AE sampler; '
+             'integer in [0, 2**32) (default: %(default)s).'
+    )
+    # END
     parser.add_argument('--work_dir', default='.', type=str)
     parser.add_argument('--save_tb', default=False, action='store_true')
     parser.add_argument('--save_model', default=False, action='store_true')
@@ -74,10 +129,50 @@ def parse_args():
     parser.add_argument('--save_video', default=False, action='store_true')
 
     args = parser.parse_args()
+    # BEGIN
+    # reject invalid AE exponents before environment setup or file writes
+    if not math.isfinite(args.ae_priority_alpha) or args.ae_priority_alpha < 0:
+        parser.error('--ae_priority_alpha must be finite and nonnegative')
+    # END
+    # BEGIN
+    # validate AE epsilon and initial-mass capacity before setup
+    if not math.isfinite(args.ae_priority_eps) or args.ae_priority_eps <= 0:
+        parser.error('--ae_priority_eps must be finite and positive')
+    if args.ae_priority_alpha > 0 and args.replay_buffer_capacity > 0:
+        max_initial_mass = np.finfo(np.float64).max / (2 * args.replay_buffer_capacity)
+        if args.ae_priority_eps > max_initial_mass:
+            parser.error('--ae_priority_eps is too large for --replay_buffer_capacity')
+    # END
+    # BEGIN
+    # validate the shared seed before any seeding or environment setup
+    if not 0 <= args.seed < 2**32:
+        parser.error('--seed must be an integer in [0, 2**32)')
+    # END
+    # BEGIN
+    # resolve and validate the effective AE batch size before setup
+    if args.ae_batch_size is None:
+        args.ae_batch_size = args.batch_size
+    if args.ae_batch_size <= 0:
+        parser.error('--ae_batch_size must be a positive integer')
+    # END
+    # BEGIN
+    # reject invalid ensemble sizes before setup or weight initialization
+    if args.n_critics < 2:
+        parser.error('--n_critics must be an integer at least 2')
+    # END
+    # BEGIN
+    # reject negative AE priority-start steps before environment setup
+    if args.ae_priority_warmup_steps < 0:
+        parser.error('--ae_priority_warmup_steps must be a nonnegative integer')
+    # END
     return args
 
 
 def evaluate(env, agent, video, num_episodes, L, step):
+    # BEGIN
+    # Keep explicit evaluation summaries for the W&B reward curves.
+    episode_rewards = []
+    # END
     for i in range(num_episodes):
         obs = env.reset()
         video.init(enabled=(i == 0))
@@ -92,6 +187,13 @@ def evaluate(env, agent, video, num_episodes, L, step):
 
         video.save('%d.mp4' % step)
         L.log('eval/episode_reward', episode_reward, step)
+        # BEGIN
+        # Reuse collected returns without changing evaluation actions or episodes.
+        episode_rewards.append(episode_reward)
+    if episode_rewards:
+        L.log('eval/mean_episode_reward', float(np.mean(episode_rewards)), step)
+        L.log('eval/best_episode_reward', float(np.max(episode_rewards)), step)
+    # END
     L.dump(step)
 
 
@@ -125,7 +227,19 @@ def make_agent(obs_shape, action_shape, args, device):
             decoder_latent_lambda=args.decoder_latent_lambda,
             decoder_weight_lambda=args.decoder_weight_lambda,
             num_layers=args.num_layers,
-            num_filters=args.num_filters
+            # BEGIN
+            # forward the configured online ensemble size to the agent
+            num_filters=args.num_filters,
+            n_critics=args.n_critics,
+            # END
+            # BEGIN
+            # forward the approved AE priority-start threshold to the agent
+            ae_priority_warmup_steps=args.ae_priority_warmup_steps,
+            # END
+            # BEGIN
+            # Route the selected AE priority estimator to the agent.
+            uncertainty_estimator=args.uncertainty_estimator
+            # END
         )
     else:
         assert 'agent is not supported: %s' % args.agent
@@ -172,7 +286,23 @@ def main():
         action_shape=env.action_space.shape,
         capacity=args.replay_buffer_capacity,
         batch_size=args.batch_size,
-        device=device
+        # BEGIN
+        # pass the approved priority exponent to the replay buffer
+        device=device,
+        ae_priority_alpha=args.ae_priority_alpha,
+        # END
+        # BEGIN
+        # pass the approved priority epsilon to the replay buffer
+        ae_priority_eps=args.ae_priority_eps,
+        # END
+        # BEGIN
+        # seed the private AE generator from the single run seed
+        ae_seed=args.seed,
+        # END
+        # BEGIN
+        # configure the replay buffer's independent default AE batch size
+        ae_batch_size=args.ae_batch_size
+        # END
     )
 
     agent = make_agent(
@@ -182,8 +312,18 @@ def main():
         device=device
     )
 
-    L = Logger(args.work_dir, use_tb=args.save_tb)
+    # BEGIN
+    # Track scalar plots with the user's wandb.yml and finalize every run.
+    wandb_config = dict(vars(args), base_method='SAC+AE')
+    with Logger(args.work_dir, use_tb=args.save_tb, use_wandb=True,
+                wandb_run_name=experiment_name(args), wandb_config=wandb_config) as L:
+        _train(args, env, agent, replay_buffer, video, model_dir, buffer_dir, L)
+    # END
 
+
+# BEGIN
+# Keep the original training loop inside the logger's managed run lifetime.
+def _train(args, env, agent, replay_buffer, video, model_dir, buffer_dir, L):
     episode, episode_reward, done = 0, 0, True
     start_time = time.time()
     for step in range(args.num_train_steps):
@@ -195,12 +335,15 @@ def main():
 
             # evaluate agent periodically
             if step % args.eval_freq == 0:
+                # BEGIN
+                # Use the official SAC+AE evaluation and saves at episode boundaries.
                 L.log('eval/episode', episode, step)
                 evaluate(env, agent, video, args.num_eval_episodes, L, step)
                 if args.save_model:
                     agent.save(model_dir, step)
                 if args.save_buffer:
                     replay_buffer.save(buffer_dir)
+                # END
 
             L.log('train/episode_reward', episode_reward, step)
 
@@ -237,6 +380,7 @@ def main():
 
         obs = next_obs
         episode_step += 1
+# END
 
 
 if __name__ == '__main__':
